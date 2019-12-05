@@ -35,7 +35,8 @@ from torch.nn import CrossEntropyLoss
 from torch.nn import functional as F
 
 from configuration_utils import PretrainedConfig
-from configuration_distilbert import DistilBertConfig
+from configuration_distilbert import DistilBertConfig, QuantizationConfig, QuantizedDistilBertConfig
+from quantization import QuantizedEmbedding, QuantizedLinear, QuantizedLayer
 from file_utils import cached_path, WEIGHTS_NAME, TF_WEIGHTS_NAME, TF2_WEIGHTS_NAME
 
 logger = logging.getLogger(__name__)
@@ -300,6 +301,44 @@ class Embeddings(nn.Module):
         embeddings = self.dropout(embeddings)               # (bs, max_seq_length, dim)
         return embeddings
 
+def quantized_embedding_setup(config, name, *args, **kwargs):
+    """
+    Get QuantizedEmbedding layer according to config params
+    """
+    try:
+        quant_config = QuantizationConfig.from_dict(getattr(config, name))
+        embedding = QuantizedEmbedding.from_config(*args, **kwargs, config=quant_config)
+    except AttributeError:
+        embedding = nn.Embedding(*args, **kwargs)
+    return embedding
+
+def quantized_linear_setup(config, name, *args, **kwargs):
+    """
+    Get QuantizedLinear layer according to config params
+    """
+    try:
+        quant_config = QuantizationConfig.from_dict(getattr(config, name))
+        linear = QuantizedLinear.from_config(*args, **kwargs, config=quant_config)
+    except AttributeError:
+        linear = nn.Linear(*args, **kwargs)
+    return linear
+
+class QuantizedBertEmbeddings(Embeddings):
+    def __init__(self, config):
+        super(Embeddings, self).__init__()
+        self.word_embeddings = quantized_embedding_setup(
+            config, 'word_embeddings', config.vocab_size, config.dim, padding_idx=0)
+        self.position_embeddings = quantized_embedding_setup(
+            config, 'position_embeddings', config.max_position_embeddings, config.dim)
+        
+        #DistilBert does not use token type embeddings
+        # self.token_type_embeddings = quantized_embedding_setup(
+        #     config, 'token_type_embeddings', config.type_vocab_size, config.hidden_size)
+
+        self.LayerNorm = nn.LayerNorm(config.dim, eps=1e-12)
+        self.dropout = nn.Dropout(config.dropout)
+
+
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, config):
         super(MultiHeadSelfAttention, self).__init__()
@@ -372,6 +411,28 @@ class MultiHeadSelfAttention(nn.Module):
         else:
             return (context,)
 
+class QuantizedMultiHeadSelfAttention(MultiHeadSelfAttention):
+    def __init__(self, config):
+        super(MultiHeadSelfAttention, self).__init__()
+        
+        self.n_heads = config.n_heads
+        self.dim = config.dim
+        self.dropout = nn.Dropout(p=config.attention_dropout)
+        self.output_attentions = config.output_attentions
+
+        assert self.dim % self.n_heads == 0
+
+        self.q_lin = quantized_linear_setup(
+            config, 'attention_query', config.dim, config.dim)
+        self.k_lin = quantized_linear_setup(
+            config, 'attention_key', config.dim, config.dim)
+        self.v_lin = quantized_linear_setup(
+            config, 'attention_value', config.dim, config.dim)
+        self.out_lin = quantized_linear_setup(
+            config, 'attention_output', config.dim, config.dim)
+
+        self.pruned_heads = set()
+
 class FFN(nn.Module):
     def __init__(self, config):
         super(FFN, self).__init__()
@@ -387,6 +448,17 @@ class FFN(nn.Module):
         x = self.lin2(x)
         x = self.dropout(x)
         return x
+
+class QuantizedFFN(FFN):
+    def __init__(self, config):
+        super(FFN, self).__init__()
+        self.dropout = nn.Dropout(p=config.dropout)
+        self.lin1 = quantized_linear_setup(
+            config, "ffn_intermediate", config.dim, config.hidden_dim)
+        self.lin2 =  quantized_linear_setup(
+            config, "ffn_output", config.hidden_dim, config.dim)
+        assert config.activation in ['relu', 'gelu'], "activation ({}) must be in ['relu', 'gelu']".format(config.activation)
+        self.activation = gelu if config.activation == 'gelu' else nn.ReLU()
 
 class TransformerBlock(nn.Module):
     def __init__(self, config):
@@ -437,6 +509,23 @@ class TransformerBlock(nn.Module):
         if self.output_attentions:
             output = (sa_weights,) + output
         return output
+
+class QuantizedBertLayer(TransformerBlock):
+    def __init__(self, config):
+        super(TransformerBlock, self).__init__()
+        self.n_heads = config.n_heads
+        self.dim = config.dim
+        self.hidden_dim = config.hidden_dim
+        self.dropout = nn.Dropout(p=config.dropout)
+        self.activation = config.activation
+        self.output_attentions  =  config.output_attentions
+
+        assert config.dim % config.n_heads == 0
+        self.attention = QuantizedMultiHeadSelfAttention(config)
+        self.sa_layer_norm = nn.LayerNorm(normalized_shape=config.dim, eps=1e-12)
+
+        self.ffn = QuantizedFFN(config)
+        self.output_layer_norm = nn.LayerNorm(normalized_shape=config.dim, eps=1e-12)
 
 class Transformer(nn.Module):
     def __init__(self, config):
@@ -498,6 +587,15 @@ class Transformer(nn.Module):
         if self.output_attentions:
             outputs = outputs + (all_attentions,)
         return outputs  # last-layer hidden state, (all hidden states), (all attentions)
+
+class QuantizedBertEncoder(Transformer):
+    def __init__(self, config):
+        super(Transformer, self).__init__()
+        self.n_layers = config.n_layers
+        self.output_attentions = config.output_attentions
+        self.output_hidden_states = config.output_hidden_states
+        layer = QuantizedBertLayer(config)
+        self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.n_layers)])
 
 ### INTERFACE FOR ENCODER AND TASK SPECIFIC MODEL ###
 class DistilBertPreTrainedModel(PreTrainedModel):
@@ -666,3 +764,58 @@ class DistilBertForQuestionAnswering(DistilBertPreTrainedModel):
             outputs = (total_loss,) + outputs
 
         return outputs  # (loss), start_logits, end_logits, (hidden_states), (attentions)
+
+
+class QuantizedDistilBertPreTrainedModel(DistilBertPreTrainedModel):
+    config_class = QuantizedDistilBertConfig
+    base_model_prefix = 'quant_distil_bert' #Figure out where this is used
+    
+    def init_weights(self, module):
+        """ Initialize the weights.
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding, QuantizedLinear, QuantizedEmbedding)):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, from_8bit=False, **kwargs):
+        if not from_8bit:
+            #Initially the pretrained_model_name_or_path would be distilbert-base-uncased
+            return super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+        #For now return None
+        return None
+
+
+class QuantizedDistilBertModel(QuantizedDistilBertPreTrainedModel, DistilBertModel):
+    def __init__(self, config):
+        # we only want BertForQuestionAnswering init to run to avoid unnecessary
+        # initializations
+        super(DistilBertModel, self).__init__(config)
+
+        self.embeddings = QuantizedBertEmbeddings(config)
+        self.transformer = QuantizedBertEncoder(config)
+        # DistilBertModel does not use a Pooler
+        # self.pooler = QuantizedBertPooler(config)
+
+        self.apply(self.init_weights)
+
+    
+class QuantizedDistilBertForQA(QuantizedDistilBertPreTrainedModel, DistilBertForQuestionAnswering):
+    def __init__(self, config):
+        super(DistilBertForQuestionAnswering, self).__init__(config)
+        # config_class = DistilBertConfig
+        # pretrained_model_archive_map = DISTILBERT_PRETRAINED_MODEL_ARCHIVE_MAP
+        # load_tf_weights = None
+        # base_model_prefix = "distilbert"
+        self.num_labels = config.num_labels
+        self.distilbert = QuantizedDistilBertModel(config)
+        self.qa_outputs = quantized_linear_setup(
+            config, "head", config.dim, config.num_labels)
+        assert config.num_labels == 2
+        self.dropout = nn.Dropout(config.qa_dropout)
+        self.apply(self.init_weights)

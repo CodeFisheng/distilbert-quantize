@@ -18,6 +18,9 @@ from __future__ import (absolute_import, division, print_function,
 
 import sys
 import json
+import copy
+import abc
+
 import logging
 from io import open
 
@@ -28,6 +31,11 @@ logger = logging.getLogger(__name__)
 DISTILBERT_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     'distilbert-base-uncased': "https://s3.amazonaws.com/models.huggingface.co/bert/distilbert-base-uncased-config.json",
     'distilbert-base-uncased-distilled-squad': "https://s3.amazonaws.com/models.huggingface.co/bert/distilbert-base-uncased-distilled-squad-config.json"
+}
+
+QUANT_BERT_PRETRAINED_CONFIG_ARCHIVE_MAP = {
+    'distilbert-base-uncased': "https://www.dropbox.com/s/k7cdy59anau6x9v/config.json",  # noqa: E501
+    'bert-large-uncased': "https://nlp-architect-data.s3-us-west-2.amazonaws.com/models/transformers/bert-large-uncased.json",  # noqa: E501
 }
 
 
@@ -87,3 +95,75 @@ class DistilBertConfig(PretrainedConfig):
     @property
     def num_hidden_layers(self):
         return self.n_layers
+
+class QuantizedDistilBertConfig(DistilBertConfig):
+    pretrained_config_archive_map = QUANT_BERT_PRETRAINED_CONFIG_ARCHIVE_MAP
+
+
+
+# ******************************************************************************
+# Copyright 2017-2019 Intel Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ******************************************************************************
+"""
+Generic config object:  
+    load config from json file
+    load config from ordinary python dict
+    export config as dictionaty or json string
+    define in init default parameters
+"""
+class QuantizationConfig(abc.ABC):
+    """Quantization Configuration Object"""
+    ATTRIBUTES = {
+        "activation_bits": 8,
+        "weight_bits": 8,
+        "mode": "none",
+        "start_step": 0,
+        "ema_decay": 0.9999,
+        "requantize_output": True
+    }
+    
+    def __init__(self, **kwargs):
+        for entry in self.ATTRIBUTES:
+            setattr(self, entry, kwargs.pop(entry, self.ATTRIBUTES[entry]))
+        if kwargs:
+            raise TypeError(f"got an unexpected keyword argument: {list(kwargs.keys())}")
+
+    @classmethod
+    def from_dict(cls, json_object):
+        """Constructs a config from a Python dictionary of parameters."""
+        config = cls()
+        for key, value in json_object.items():
+            config.__dict__[key] = value
+        return config
+
+    def __repr__(self):
+        return str(self.to_json_string())
+
+    def to_json_string(self):
+        """Serializes this instance to a JSON string."""
+        return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
+
+    def to_dict(self):
+        """Serializes this instance to a Python dictionary."""
+        output = copy.deepcopy(self.__dict__)
+        return output
+
+    @classmethod
+    def from_json_file(cls, json_file):
+        """Constructs Config from a json file of parameters."""
+        with open(json_file, "r", encoding='utf-8') as reader:
+            text = reader.read()
+        
+        return cls.from_dict(json.loads(text))
